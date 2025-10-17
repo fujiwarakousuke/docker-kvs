@@ -12,18 +12,22 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # docker-compose 単体バイナリを用意（無ければ取得）
+          # ユーザー権限で置ける場所に docker-compose を配置
+          DEST="$HOME/.local/bin"
+          mkdir -p "$DEST"
+          export PATH="$DEST:$PATH"
+
           if ! command -v docker-compose >/dev/null 2>&1; then
-            curl -L -o /usr/local/bin/docker-compose \
+            curl -L -o "$DEST/docker-compose" \
               "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
-            chmod +x /usr/local/bin/docker-compose
+            chmod +x "$DEST/docker-compose"
           fi
           docker-compose version
 
-          # known_hosts 登録（初回の Host key verification failed 対策）
+          # known_hosts 登録（初回の Host key verification 対策）
           mkdir -p ~/.ssh
           if ! ssh-keygen -F 192.168.10.64 >/dev/null; then
-            ssh-keyscan -H 192.168.10.64 >> ~/.ssh/known_hosts
+            ssh-keyscan -H 192.168.10.64 >> ~/.ssh/known_hosts || true
           fi
         '''
       }
@@ -49,13 +53,16 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # Composeファイルはワークスペース直下にある前提（無ければ失敗するので先に cat で確認）
-          cat docker-compose.build.yml
+          # docker-compose を見つけられるよう PATH を前置（各 sh ブロックで必要）
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Composeファイルを確認
+          test -f docker-compose.build.yml && cat docker-compose.build.yml
 
           # DOCKER_HOST=ssh://... でリモートデーモンを指定
           export DOCKER_HOST=ssh://${BUILD_HOST}
 
-          # 旧コンテナ/ボリューム整理（あってもなくてもOK）
+          # 旧コンテナ/ボリューム整理（存在しなくてもOK）
           docker-compose -f docker-compose.build.yml down || true
           docker volume prune -f || true
 
