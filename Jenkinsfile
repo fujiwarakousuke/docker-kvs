@@ -29,12 +29,12 @@ pipeline {
                 script {
                     def timestamp = sh(script: "date +%Y%m%d-%H%M%S", returnStdout: true).trim()
                     
-                    sh "cat docker compose.build.yml"
-                    sh "docker compose -H ssh://${BUILD_HOST} -f docker compose.build.yml down || true"
+                    sh "cat docker-compose.build.yml"
+                    sh "docker compose -H ssh://${BUILD_HOST} -f docker-compose.build.yml down || true"
                     sh "docker -H ssh://${BUILD_HOST} volume prune -f || true"
-                    sh "docker compose -H ssh://${BUILD_HOST} -f docker compose.build.yml build"
-                    sh "docker compose -H ssh://${BUILD_HOST} -f docker compose.build.yml up -d"
-                    sh "docker compose -H ssh://${BUILD_HOST} -f docker compose.build.yml ps"
+                    sh "docker compose -H ssh://${BUILD_HOST} -f docker-compose.build.yml build"
+                    sh "docker compose -H ssh://${BUILD_HOST} -f docker-compose.build.yml up -d"
+                    sh "docker compose -H ssh://${BUILD_HOST} -f docker-compose.build.yml ps"
                 }
             }
         }
@@ -45,7 +45,7 @@ pipeline {
                     sh "docker -H ssh://${BUILD_HOST} container exec dockerkvs_apptest pytest -v test_app.py"
                     sh "docker -H ssh://${BUILD_HOST} container exec dockerkvs_webtest pytest -v test_static.py"
                     sh "docker -H ssh://${BUILD_HOST} container exec dockerkvs_webtest pytest -v test_selenium.py"
-                    sh "docker compose -H ssh://${BUILD_HOST} -f docker compose.build.yml down || true"
+                    sh "docker compose -H ssh://${BUILD_HOST} -f docker-compose.build.yml down || true"
                 }
             }
         }
@@ -63,7 +63,7 @@ pipeline {
         stage('Deploy') {
             steps {
                 script {
-                    sh "ssh ${PROD_HOST} 'docker pull ${DOCKERHUB_USER}/dockerkvs_web:${timestamp} && docker compose -f docker compose.prod.yml up -d'"
+                    sh "ssh ${PROD_HOST} 'docker pull ${DOCKERHUB_USER}/dockerkvs_web:${timestamp} && docker compose -f docker-compose.prod.yml up -d'"
                 }
             }
         }
