@@ -2,7 +2,7 @@ pipeline {
   agent any
   environment {
     DOCKERHUB_USER = "fujiwarakousuke"
-    BUILD_HOST = "root@192.168.10.64"
+    BUILD_HOST = "root@192.168.10.30"
     PROD_HOST  = "root@192.168.10.64"
     DOCKER_BUILDKIT = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
