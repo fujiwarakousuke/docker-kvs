@@ -4,13 +4,13 @@ pipeline {
 
   environment {
     DOCKERHUB_USER           = 'fujiwarakousuke'
-    BUILD_HOST               = '192.168.10.64'      // Dockerリモートホスト
+    BUILD_HOST               = '192.168.10.64'
     DOCKER_BUILDKIT          = '1'
     COMPOSE_DOCKER_CLI_BUILD = '1'
-    DOCKER_CONFIG            = "${WORKSPACE}/.docker" // このジョブ専用の docker 認証保存先
-    COMPOSE_PROJECT_NAME     = 'docker-kvs'         // 掃除の安全性のため固定プロジェクト名
+    DOCKER_CONFIG            = "${WORKSPACE}/.docker"
+    COMPOSE_PROJECT_NAME     = 'docker-kvs'
     REGISTRY                 = 'docker.io'
-    PULL_PLATFORM            = 'linux/amd64'        // 例：x86_64ホスト。ARMなら linux/arm64 に変更
+    PULL_PLATFORM            = 'linux/amd64'   // ARMなら linux/arm64 に変更
   }
 
   stages {
@@ -23,7 +23,6 @@ pipeline {
           mkdir -p "$DEST" "$DOCKER_CONFIG" "$HOME/.ssh"
           export PATH="$DEST:$PATH"
 
-          # docker-compose v2 単体バイナリ（クライアント側）
           if ! command -v docker-compose >/dev/null 2>&1; then
             curl -fsSL -o "$DEST/docker-compose" \
               "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
@@ -31,7 +30,6 @@ pipeline {
           fi
           docker-compose version
 
-          # known_hosts へリモート鍵登録
           if ! ssh-keygen -F "$BUILD_HOST" >/dev/null; then
             ssh-keyscan -H "$BUILD_HOST" >> "$HOME/.ssh/known_hosts"
           fi
@@ -69,12 +67,9 @@ pipeline {
         ]) {
           sh '''
             set -eux
-
-            # クライアント側に認証保存（daemon不要）
             mkdir -p "$DOCKER_CONFIG"
             echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
 
-            # リモート側にも明示ログイン（レート制限/401対策）
             ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
               "${SSH_USER}@${BUILD_HOST}" \
               "mkdir -p ~/.docker && echo '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY'"
@@ -119,7 +114,7 @@ PY
       }
     }
 
-    stage('Build & Up on remote (pull with retry)') {
+    stage('Build & Up on remote (pull with retry, POSIX-safe)') {
       steps {
         withCredentials([
           sshUserPrivateKey(credentialsId: 'ssh_build_host',
@@ -132,7 +127,7 @@ PY
           sh '''
             set -eux
 
-            # ===== ssh-agent 準備 =====
+            # ssh-agent（リモートDockerへDOCKER_HOST=ssh://）
             eval "$(ssh-agent -s)"
             trap 'ssh-agent -k || true' EXIT
             chmod 600 "$SSH_KEY" || true
@@ -141,57 +136,62 @@ PY
             export PATH="$HOME/.local/bin:$PATH"
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
-            # ===== 補助関数 =====
+            # ===== POSIX 関数: Bash依存なし =====
             refresh_auth() {
-              # 使い方: refresh_auth <user> <pass>
-              local duser="$1" dpass="$2"
+              duser="$1"
+              dpass="$2"
               set +x
-              echo "$dpass" | docker login -u "$duser" --password-stdin "$REGISTRY" >/dev/null 2>&1 || true
+              printf '%s\n' "$dpass" | docker login -u "$duser" --password-stdin "$REGISTRY" >/dev/null 2>&1 || true
               set -x
               ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
                 "${SSH_USER}@${BUILD_HOST}" \
-                "echo '$dpass' | docker login -u '$duser' --password-stdin '$REGISTRY' >/dev/null 2>&1 || true"
+                "printf '%s\\n' '$dpass' | docker login -u '$duser' --password-stdin '$REGISTRY' >/dev/null 2>&1 || true"
             }
 
             docker_pull_retry_auth() {
-              # 使い方: docker_pull_retry_auth [--platform linux/amd64] IMAGE[:TAG]
-              local opts=()
-              while [ $# -gt 0 ] && echo "$1" | grep -q '^--'; do
-                opts="$opts $1 $2"; shift 2
+              # 使い方: docker_pull_retry_auth [--platform <plat>] IMAGE[:TAG]
+              opts=""
+              while [ $# -gt 1 ] && printf %s "$1" | grep -q '^--'; do
+                opts="$opts $1 $2"
+                shift 2
               done
-              local img="$1"; shift || true
+              img="$1"; shift 2>/dev/null || true
 
-              local max=7 try=1 rc=0 out=
-              while [ $try -le $max ]; do
-                echo "[pull] ($try/$max) $opts $img"
+              max=7
+              try=1
+              while [ "$try" -le "$max" ]; do
+                echo "[pull] ($try/$max)${opts:+ $opts} $img"
                 set +e
-                out="$(eval docker pull $opts \"$img\" 2>&1)"; rc=$?
+                if [ -n "$opts" ]; then
+                  out=$(eval docker pull $opts "\"$img\"" 2>&1); rc=$?
+                else
+                  out=$(docker pull "$img" 2>&1); rc=$?
+                fi
                 set -e
                 echo "$out"
-                if [ $rc -eq 0 ]; then
+                if [ "$rc" -eq 0 ]; then
                   return 0
                 fi
-                if echo "$out" | grep -qiE 'unauthorized|denied|authentication required'; then
+                echo "$out" | grep -qiE 'unauthorized|denied|authentication required' && {
                   echo "[pull] auth error; refreshing credentials..."
                   refresh_auth "$DUSER" "$DPASS"
-                fi
+                }
                 sleep $((10 * try))
-                try=$((try+1))
+                try=$((try + 1))
               done
-              echo "[pull] FAILED: $opts $img"
+              echo "[pull] FAILED:${opts:+ $opts} $img"
               return 1
             }
 
-            # ===== 先に必要イメージをタグで取得（digest固定はしない）=====
-            docker_pull_retry_auth --platform "$PULL_PLATFORM" "docker.io/selenium/hub:3.141.59-vanadium"
-            docker_pull_retry_auth --platform "$PULL_PLATFORM" "docker.io/selenium/node-chrome:3.141.59-vanadium"
-            docker_pull_retry_auth --platform "$PULL_PLATFORM" "docker.io/redis:5.0.6-alpine3.10"
+            # 先に必要ベースイメージをタグ＋platform指定で取得（digest固定はしない）
+            docker_pull_retry_auth --platform "$PULL_PLATFORM" docker.io/selenium/hub:3.141.59-vanadium
+            docker_pull_retry_auth --platform "$PULL_PLATFORM" docker.io/selenium/node-chrome:3.141.59-vanadium
+            docker_pull_retry_auth --platform "$PULL_PLATFORM" docker.io/redis:5.0.6-alpine3.10
 
-            # ===== Compose 実行（リモートエンジン上）=====
+            # Compose 実行（すべてリモートの Docker エンジン上）
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml down --remove-orphans || true
-            # プロジェクトに紐づくボリュームも掃除（必要でなければ外してください）
             docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" | xargs -r docker volume rm || true
 
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml build
