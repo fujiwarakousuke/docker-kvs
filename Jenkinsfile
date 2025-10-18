@@ -5,7 +5,6 @@ pipeline {
   environment {
     DOCKERHUB_USER = "fujiwarakousuke"
     BUILD_HOST = "192.168.10.64"
-    PROD_HOST  = "192.168.10.64"
     DOCKER_BUILDKIT = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
   }
@@ -15,7 +14,7 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # 念のため過去の環境変数を無効化
+          # 古い設定を無効化
           unset DOCKER_SSH_COMMAND || true
           unset GIT_SSH_COMMAND || true
           unset SSH_COMMAND || true
@@ -39,14 +38,14 @@ pipeline {
       }
     }
 
-    stage('Sanity check (SSH & Docker)') {
+    stage('Sanity check (plain SSH & Docker)') {
       steps {
         withCredentials([sshUserPrivateKey(credentialsId: 'ssh_build_host',
                                            keyFileVariable: 'SSH_KEY',
                                            usernameVariable: 'SSH_USER')]) {
           sh '''
             set -eux
-            unset DOCKER_SSH_COMMAND || true
+            # 鍵で素のSSH試験
             ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
               "${SSH_USER}@${BUILD_HOST}" 'echo OK && whoami && id -nG && docker version --format "{{.Server.Version}}"'
           '''
@@ -54,75 +53,65 @@ pipeline {
       }
     }
 
-    stage('Write Docker auth (local config.json)') {
+    stage('Docker registry login (remote)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub_fuji',
-                                          usernameVariable: 'DUSER',
-                                          passwordVariable: 'DPASS')]) {
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'ssh_build_host', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER'),
+          usernamePassword(credentialsId: 'dockerhub_fuji', usernameVariable: 'DUSER', passwordVariable: 'DPASS')
+        ]) {
           sh '''
             set -eux
-            unset DOCKER_SSH_COMMAND || true
-            mkdir -p "$HOME/.docker"
-            umask 077
-            AUTH="$( (printf "%s" "$DUSER:$DPASS" | base64 -w0) 2>/dev/null || printf "%s" "$DUSER:$DPASS" | base64 )"
-            cat > "$HOME/.docker/config.json" <<JSON
-{
-  "auths": {
-    "https://index.docker.io/v1/": { "auth": "${AUTH}" }
-  }
-}
-JSON
-            grep -H "auths" "$HOME/.docker/config.json"
+            # リモート側で docker login（デーモンに資格を入れる）
+            ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              "${SSH_USER}@${BUILD_HOST}" "echo '$DPASS' | docker login -u '$DUSER' --password-stdin"
           '''
         }
       }
     }
 
-    stage('Build & Up (compose over SSH, via agent)') {
+    stage('Build & Up via compose over SSH (force our ssh)') {
       steps {
         withCredentials([sshUserPrivateKey(credentialsId: 'ssh_build_host',
                                            keyFileVariable: 'SSH_KEY',
                                            usernameVariable: 'SSH_USER')]) {
           sh '''
             set -eux
-            export PATH="$HOME/.local/bin:$PATH"
 
-            # 0) 古いDOCKER_SSH_COMMAND/GIT_SSH_COMMANDを確実に殺す
-            unset DOCKER_SSH_COMMAND || true
-            unset GIT_SSH_COMMAND || true
-            unset SSH_COMMAND || true
+            # 0) PATH 先頭に ssh ラッパを配置（/usr/bin/ssh を直叩き）
+            mkdir -p "$WORKSPACE/bin"
+            cat > "$WORKSPACE/bin/ssh" <<'SH'
+#!/bin/sh
+exec /usr/bin/ssh -F /dev/null \
+  -o IdentitiesOnly=no \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  "$@"
+SH
+            chmod +x "$WORKSPACE/bin/ssh"
+            export PATH="$WORKSPACE/bin:$PATH"
 
-            # 1) ssh-agent起動 & 鍵ロード
+            # 1) ssh-agent に鍵を載せる（ラッパは -i を一切使わない）
             eval "$(ssh-agent -s)"
             chmod 600 "$SSH_KEY" || true
             ssh-add "$SSH_KEY"
 
-            # 2) ~/.ssh/config を完全に無視するラッパを作成（-i指定なし、agent優先）
-            SSH_WRAP="$WORKSPACE/.sshwrap"
-            cat > "$SSH_WRAP" <<'SH'
-#!/bin/sh
-# ignore user ssh config and rely on ssh-agent
-exec ssh -F /dev/null -o IdentitiesOnly=no -o BatchMode=yes -o StrictHostKeyChecking=yes "$@"
-SH
-            chmod +x "$SSH_WRAP"
-            export DOCKER_SSH_COMMAND="$SSH_WRAP"
-
-            # 3) リモートdockerに接続するエンドポイント
+            # 2) docker は ssh を PATH から探すので、上のラッパが必ず使われる
+            export PATH="$HOME/.local/bin:$PATH"
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
-            # 4) Composeファイル確認
+            # 3) Composeファイルを確認
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
-            # 5) 掃除（存在しなくてもOK）
+            # 4) 掃除
             docker-compose -f docker-compose.build.yml down --remove-orphans || true
             docker volume prune -f || true
 
-            # 6) ビルド → 起動 → 状態確認
+            # 5) ビルド→起動→確認
             docker-compose -f docker-compose.build.yml build
             docker-compose -f docker-compose.build.yml up -d
             docker-compose -f docker-compose.build.yml ps
 
-            # 7) agent停止
+            # 6) agent 終了
             ssh-agent -k
           '''
         }
