@@ -65,10 +65,12 @@ ssh -i "$SSH_KEY" \
           sh '''#!/usr/bin/env bash
 set -Eeuo pipefail
 mkdir -p "$DOCKER_CONFIG"
+# これはデーモン不要（レジストリへ直接認証）
 echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
 test -s "$DOCKER_CONFIG/config.json"
 grep -q '"auths"' "$DOCKER_CONFIG/config.json"
-docker info >/dev/null
+# デーモンに触らない確認だけにする
+docker --version
 '''
         }
       }
@@ -115,7 +117,7 @@ JSON
 }
 refresh_auth "$DUSER" "$DPASS"
 
-# ===== 保険：リモート側にも login（ssh 経由で直接 docker CLI を叩くケースに備え）=====
+# ===== 保険：リモート側にも login =====
 ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
   "${SSH_USER}@${BUILD_HOST}" '
     mkdir -p ~/.docker
@@ -126,20 +128,16 @@ ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
     echo "'"$DPASS"'" | docker login -u "'"$DUSER"'" --password-stdin "'"$REGISTRY"'"
   '
 
-# ===== pull の堅牢化：401/denied 検知で再ログイン＋指数バックオフ =====
+# ===== pull の堅牢化（401時は再ログインして再試行）=====
 docker_pull_retry_auth() {
   local img="$1" max=7 try=1
   while (( try <= max )); do
     echo "[pull] ($try/$max) $img"
-    # 出力を掴んで判定
     set +e
-    local out
-    out="$(docker pull "$img" 2>&1)"; rc=$?
+    local out; out="$(docker pull "$img" 2>&1)"; rc=$?
     set -e
     echo "$out"
-    if (( rc == 0 )); then
-      return 0
-    fi
+    if (( rc == 0 )); then return 0; fi
     if echo "$out" | grep -qiE 'unauthorized|denied|authentication required'; then
       echo "[pull] auth error detected; refreshing credentials and re-login..."
       refresh_auth "$DUSER" "$DPASS"
@@ -154,7 +152,7 @@ docker_pull_retry_auth() {
   echo "[pull] FAILED: $img"; return 1
 }
 
-# Compose ファイル確認（ログの行つなぎに見えるのは set -x の表示順序の問題）
+# Compose ファイル確認
 test -f docker-compose.build.yml && cat docker-compose.build.yml
 
 # 大きいイメージ向け：堅牢 pull
