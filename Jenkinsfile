@@ -3,13 +3,13 @@ pipeline {
   options { timestamps() }
 
   environment {
-    DOCKERHUB_USER        = "fujiwarakousuke"
-    BUILD_HOST            = "192.168.10.64"           // 接続先ホスト
-    DOCKER_BUILDKIT       = "1"
+    DOCKERHUB_USER           = "fujiwarakousuke"
+    BUILD_HOST               = "192.168.10.64"           // 接続先ホスト
+    DOCKER_BUILDKIT          = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
-    DOCKER_CONFIG         = "${WORKSPACE}/.docker"    // このジョブ専用の docker 認証保存先
-    COMPOSE_PROJECT_NAME  = "docker-kvs"              // プロジェクト名固定（掃除の安全性）
-    REGISTRY              = "docker.io"
+    DOCKER_CONFIG            = "${WORKSPACE}/.docker"    // このジョブ専用の docker 認証保存先
+    COMPOSE_PROJECT_NAME     = "docker-kvs"              // プロジェクト名固定（掃除の安全性）
+    REGISTRY                 = "docker.io"
   }
 
   stages {
@@ -83,7 +83,8 @@ pipeline {
                            usernameVariable: 'DUSER',
                            passwordVariable: 'DPASS')
         ]) {
-          sh '''
+          // ← /bin/sh では pipefail が使えないため、このステージだけ Bash で実行
+          sh(script: '''
             set -euo pipefail
 
             # ===== ssh-agent 準備（DOCKER_HOST=ssh が agent を利用）=====
@@ -97,8 +98,7 @@ pipeline {
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
             # ===== 重要: DOCKER_AUTH_CONFIG を動的生成して毎APIに認証を同送 =====
-            # （秘密が出ないよう echo を止める）
-            set +x
+            set +x  # ← 秘密を出さない
             AUTH="$(printf '%s' "$DUSER:$DPASS" | base64 | tr -d '\\n')"
             export DOCKER_AUTH_CONFIG="$(cat <<JSON
 {"auths":{
@@ -144,7 +144,7 @@ JSON
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml build
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml up -d
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml ps
-          '''
+          ''', shell: '/bin/bash')
         }
       }
     }
