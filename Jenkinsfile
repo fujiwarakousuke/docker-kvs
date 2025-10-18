@@ -4,7 +4,6 @@ pipeline {
 
   environment {
     DOCKERHUB_USER = "fujiwarakousuke"
-    // ユーザー名は Credentials 側で渡す想定（ここはIP/ホスト名のみ）
     BUILD_HOST = "192.168.10.64"
     PROD_HOST  = "192.168.10.64"
     DOCKER_BUILDKIT = "1"
@@ -16,7 +15,6 @@ pipeline {
       steps {
         sh '''
           set -eux
-          # ユーザー権限で docker-compose（単体バイナリ）を用意
           DEST="$HOME/.local/bin"
           mkdir -p "$DEST"
           export PATH="$DEST:$PATH"
@@ -27,7 +25,6 @@ pipeline {
           fi
           docker-compose version
 
-          # known_hosts 登録（初回のみ追加）
           mkdir -p ~/.ssh
           if ! ssh-keygen -F "$BUILD_HOST" >/dev/null; then
             ssh-keyscan -H "$BUILD_HOST" >> ~/.ssh/known_hosts || true
@@ -38,11 +35,17 @@ pipeline {
 
     stage('Pre Check') {
       steps {
-        sh '''
-          set -eux
-          # Docker Hub 認証設定があれば軽く表示（無ければスキップ）
-          test -f ~/.docker/config.json && grep -H "docker.io" ~/.docker/config.json || true
-        '''
+        script {
+          def dockerConfigExists = sh(
+            script: 'test -f ~/.docker/config.json && echo true || echo false',
+            returnStdout: true
+          ).trim()
+          if (dockerConfigExists == 'true') {
+            sh 'grep -H "docker.io" ~/.docker/config.json || true'
+          } else {
+            echo "Warning: Docker config not found. Skipping Docker login check."
+          }
+        }
       }
     }
 
@@ -53,9 +56,12 @@ pipeline {
                                            usernameVariable: 'SSH_USER')]) {
           sh '''
             set -eux
-            # 鍵で SSH 疎通 & Docker サーバ版確認（失敗で即中断）
-            ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-              "$SSH_USER@$BUILD_HOST" 'echo OK; whoami; id -nG; docker version --format "{{.Server.Version}}"'
+            # 鍵を直指定して疎通確認（ここは DOCKER_SSH_COMMAND を使う）
+            ssh -i "$SSH_KEY" \
+                -o IdentitiesOnly=yes \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "${SSH_USER}@${BUILD_HOST}" 'echo OK; whoami; id -nG; docker version --format "{{.Server.Version}}"'
           '''
         }
       }
@@ -69,15 +75,22 @@ pipeline {
           sh '''
             set -eux
             export PATH="$HOME/.local/bin:$PATH"
-
-            # Compose ファイル確認（無ければ失敗）
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
-            # docker / compose が内部で使う SSH コマンド（秘密鍵・非対話・厳格チェック）
-            export DOCKER_SSH_COMMAND="ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=yes"
+            # ★ Compose v2 は DOCKER_SSH_COMMAND を基本見ないので ~/.ssh/config を用意
+            mkdir -p ~/.ssh
+            cat > ~/.ssh/config <<EOF
+Host ${BUILD_HOST}
+  HostName ${BUILD_HOST}
+  User ${SSH_USER}
+  IdentityFile ${SSH_KEY}
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+EOF
+            chmod 600 ~/.ssh/config
 
-            # DOCKER_HOST を SSH で指定（ユーザーは Credentials の SSH_USER を使用）
-            export DOCKER_HOST=ssh://$SSH_USER@$BUILD_HOST
+            # DOCKER_HOST は ssh:// ユーザー@ホスト を指定（ssh は ~/.ssh/config を参照）
+            export DOCKER_HOST=ssh://${SSH_USER}@${BUILD_HOST}
 
             # 旧リソース掃除（存在しなくてもOK）
             docker-compose -f docker-compose.build.yml down --remove-orphans || true
