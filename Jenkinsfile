@@ -2,44 +2,45 @@ pipeline {
   agent any
   environment {
     DOCKERHUB_USER = "fujiwarakousuke"
-    BUILD_HOST = "root@192.168.10.64"     // root禁止なら jenkins@192.168.10.64
+    BUILD_HOST = "root@192.168.10.64"
     PROD_HOST  = "root@192.168.10.64"
     DOCKER_BUILDKIT = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
   }
   stages {
-    stage('Prepare docker-compose & known_hosts') {
+    stage('Prepare docker-compose & SSH known_hosts') {
       steps {
-        sshagent (credentials: ['ssh_build_host']) {
-          sh '''
-            set -eux
-            # docker-compose 単体バイナリをユーザー権限で配置
-            DEST="$HOME/.local/bin"
-            mkdir -p "$DEST"
-            export PATH="$DEST:$PATH"
-            if ! command -v docker-compose >/dev/null 2>&1; then
-              curl -L -o "$DEST/docker-compose" \
-                "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
-              chmod +x "$DEST/docker-compose"
-            fi
-            docker-compose version
+        sh '''
+          set -eux
+          # ユーザー権限で置ける場所に docker-compose を配置
+          DEST="$HOME/.local/bin"
+          mkdir -p "$DEST"
+          export PATH="$DEST:$PATH"
 
-            # known_hosts 登録（初回 handshake 失敗回避）
-            mkdir -p ~/.ssh
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            curl -L -o "$DEST/docker-compose" \
+              "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
+            chmod +x "$DEST/docker-compose"
+          fi
+          docker-compose version
+
+          # known_hosts 登録（初回の Host key verification 対策）
+          mkdir -p ~/.ssh
+          if ! ssh-keygen -F 192.168.10.64 >/dev/null; then
             ssh-keyscan -H 192.168.10.64 >> ~/.ssh/known_hosts || true
-
-            # SSH 経由で Docker に触れる疎通確認（失敗なら明示で落とす）
-            ssh -o BatchMode=yes "$BUILD_HOST" 'docker version --format="{{.Server.Version}}"'
-          '''
-        }
+          fi
+        '''
       }
     }
 
     stage('Pre Check') {
       steps {
         script {
-          def hasCfg = sh(script: 'test -f ~/.docker/config.json && echo yes || echo no', returnStdout: true).trim()
-          if (hasCfg == 'yes') {
+          def dockerConfigExists = sh(
+            script: 'test -f ~/.docker/config.json && echo true || echo false',
+            returnStdout: true
+          ).trim()
+          if (dockerConfigExists == 'true') {
             sh 'grep -H "docker.io" ~/.docker/config.json || true'
           } else {
             echo "Warning: Docker config not found. Skipping Docker login check."
@@ -48,30 +49,28 @@ pipeline {
       }
     }
 
-    stage('Build on remote with compose') {
+    stage('Build') {
       steps {
-        sshagent (credentials: ['ssh_build_host']) {
-          sh '''
-            set -eux
-            export PATH="$HOME/.local/bin:$PATH"
-            test -f docker-compose.build.yml && cat docker-compose.build.yml
+        sh '''
+          set -eux
+          # docker-compose を見つけられるよう PATH を前置（各 sh ブロックで必要）
+          export PATH="$HOME/.local/bin:$PATH"
 
-            # DOCKER_HOST をSSHで指定（パスワード非対話のため鍵が必須）
-            export DOCKER_HOST=ssh://${BUILD_HOST}
+          # Composeファイルを確認
+          test -f docker-compose.build.yml && cat docker-compose.build.yml
 
-            # SSHオプション（バッチ・KnownHostsを強制）
-            export DOCKER_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes'
+          # DOCKER_HOST=ssh://... でリモートデーモンを指定
+          export DOCKER_HOST=ssh://${BUILD_HOST}
 
-            # 旧リソース掃除（存在しなくてもOK）
-            docker-compose -f docker-compose.build.yml down || true
-            docker volume prune -f || true
+          # 旧コンテナ/ボリューム整理（存在しなくてもOK）
+          docker-compose -f docker-compose.build.yml down || true
+          docker volume prune -f || true
 
-            # ビルド→起動→状態確認
-            docker-compose -f docker-compose.build.yml build
-            docker-compose -f docker-compose.build.yml up -d
-            docker-compose -f docker-compose.build.yml ps
-          '''
-        }
+          # ビルド → 起動 → 状態確認
+          docker-compose -f docker-compose.build.yml build
+          docker-compose -f docker-compose.build.yml up -d
+          docker-compose -f docker-compose.build.yml ps
+        '''
       }
     }
   }
