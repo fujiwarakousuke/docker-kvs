@@ -3,16 +3,17 @@ pipeline {
   options { timestamps() }
 
   environment {
-    DOCKERHUB_USER  = "fujiwarakousuke"
-    BUILD_HOST      = "192.168.10.64"        // 接続先ホスト(IPのみ)
-    DOCKER_BUILDKIT = "1"
+    DOCKERHUB_USER        = "fujiwarakousuke"
+    BUILD_HOST            = "192.168.10.64"           // 接続先ホスト
+    DOCKER_BUILDKIT       = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
-    DOCKER_CONFIG   = "${WORKSPACE}/.docker" // このジョブ専用の docker 認証保存先
-    COMPOSE_PROJECT_NAME = "docker-kvs"      // プロジェクト名を固定
-    REGISTRY = "docker.io"
+    DOCKER_CONFIG         = "${WORKSPACE}/.docker"    // このジョブ専用の docker 認証保存先
+    COMPOSE_PROJECT_NAME  = "docker-kvs"              // プロジェクト名固定（掃除の安全性）
+    REGISTRY              = "docker.io"
   }
 
   stages {
+
     stage('Prepare docker-compose & known_hosts') {
       steps {
         sh '''
@@ -72,7 +73,7 @@ pipeline {
       }
     }
 
-    stage('Build on remote with compose (over SSH)') {
+    stage('Build on remote with compose (over SSH + stable auth)') {
       steps {
         withCredentials([
           sshUserPrivateKey(credentialsId: 'ssh_build_host',
@@ -83,22 +84,36 @@ pipeline {
                            passwordVariable: 'DPASS')
         ]) {
           sh '''
-            set -eux
+            set -euo pipefail
 
-            # ssh-agent に鍵を積む（DOCKER_HOST=ssh が agent を利用）
+            # ===== ssh-agent 準備（DOCKER_HOST=ssh が agent を利用）=====
             eval "$(ssh-agent -s)"
             trap 'ssh-agent -k || true' EXIT
             chmod 600 "$SSH_KEY" || true
-            ssh-add "$SSH_KEY"
-            ssh-add -l
+            ssh-add "$SSH_KEY" >/dev/null
+            ssh-add -l || true
 
             export PATH="$HOME/.local/bin:$PATH"
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
-            # ★ 重要：DOCKER_HOST=ssh 設定後に docker login を再実行（認証を確実に伝達）
-            echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" >/dev/null
+            # ===== 重要: DOCKER_AUTH_CONFIG を動的生成して毎APIに認証を同送 =====
+            # （秘密が出ないよう echo を止める）
+            set +x
+            AUTH="$(printf '%s' "$DUSER:$DPASS" | base64 | tr -d '\\n')"
+            export DOCKER_AUTH_CONFIG="$(cat <<JSON
+{"auths":{
+  "https://index.docker.io/v1/":{"auth":"$AUTH"},
+  "https://registry-1.docker.io/v2/":{"auth":"$AUTH"},
+  "docker.io":{"auth":"$AUTH"}
+}}
+JSON
+)"
+            set -x
 
-            # （任意・保険）リモート環境での login も実施しておく
+            # 保険：DOCKER_HOST 設定後にも login 実施（エンジン側にトークン保存）
+            echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" >/dev/null 2>&1 || true
+
+            # （任意の保険）リモート側でも login 実施
             ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
               "${SSH_USER}@${BUILD_HOST}" \
               "echo '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY' || true"
@@ -106,11 +121,16 @@ pipeline {
             # Compose ファイル確認
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
-            # Pull をリトライ付きで安定化
-            pull_retry() { img="$1"; n=0; until [ $n -ge 3 ]; do
-              docker pull "$img" && break
-              n=$((n+1)); sleep $((5*n))
-            done; }
+            # 大きいイメージ向け: リトライを厚めに
+            pull_retry() {
+              img="$1"; n=0
+              until [ $n -ge 6 ]; do
+                docker pull "$img" && break
+                n=$((n+1)); sleep $((10*n))
+              done
+              [ $n -lt 6 ] || { echo "FAILED to pull: $img"; exit 1; }
+            }
+
             pull_retry "docker.io/selenium/hub:3.141.59-vanadium"
             pull_retry "docker.io/selenium/node-chrome:3.141.59-vanadium"
             pull_retry "docker.io/redis:5.0.6-alpine3.10"
