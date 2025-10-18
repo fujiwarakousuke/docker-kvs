@@ -4,11 +4,12 @@ pipeline {
 
   environment {
     DOCKERHUB_USER  = "fujiwarakousuke"
-    BUILD_HOST      = "192.168.10.64"      // 接続先ホスト(IPのみ)
+    BUILD_HOST      = "192.168.10.64"        // 接続先ホスト(IPのみ)
     DOCKER_BUILDKIT = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
     DOCKER_CONFIG   = "${WORKSPACE}/.docker" // このジョブ専用の docker 認証保存先
-    COMPOSE_PROJECT_NAME = "docker-kvs"      // プロジェクト名を固定（掃除の安全性・再現性）
+    COMPOSE_PROJECT_NAME = "docker-kvs"      // プロジェクト名を固定
+    REGISTRY = "docker.io"
   }
 
   stages {
@@ -28,7 +29,7 @@ pipeline {
           fi
           docker-compose version
 
-          # known_hosts へ登録（取得失敗時はビルドを停止）
+          # known_hosts へ登録（取得失敗時はビルド停止）
           if ! ssh-keygen -F "$BUILD_HOST" >/dev/null; then
             ssh-keyscan -H "$BUILD_HOST" >> "$HOME/.ssh/known_hosts"
           fi
@@ -63,7 +64,7 @@ pipeline {
           sh '''
             set -eux
             mkdir -p "$DOCKER_CONFIG"
-            echo "$DPASS" | docker login -u "$DUSER" --password-stdin
+            echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
             test -s "$DOCKER_CONFIG/config.json"
             grep -q '"auths"' "$DOCKER_CONFIG/config.json"
           '''
@@ -73,9 +74,14 @@ pipeline {
 
     stage('Build on remote with compose (over SSH)') {
       steps {
-        withCredentials([sshUserPrivateKey(credentialsId: 'ssh_build_host',
-                                           keyFileVariable: 'SSH_KEY',
-                                           usernameVariable: 'SSH_USER')]) {
+        withCredentials([
+          sshUserPrivateKey(credentialsId: 'ssh_build_host',
+                            keyFileVariable: 'SSH_KEY',
+                            usernameVariable: 'SSH_USER'),
+          usernamePassword(credentialsId: 'dockerhub_fuji',
+                           usernameVariable: 'DUSER',
+                           passwordVariable: 'DPASS')
+        ]) {
           sh '''
             set -eux
 
@@ -89,13 +95,25 @@ pipeline {
             export PATH="$HOME/.local/bin:$PATH"
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
+            # ★ 重要：DOCKER_HOST=ssh 設定後に docker login を再実行（認証を確実に伝達）
+            echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" >/dev/null
+
+            # （任意・保険）リモート環境での login も実施しておく
+            ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              "${SSH_USER}@${BUILD_HOST}" \
+              "echo '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY' || true"
+
             # Compose ファイル確認
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
-            # 事前 pull（疎通・認証の早期検知）
-            docker pull selenium/hub:3.141.59-vanadium
-            docker pull selenium/node-chrome:3.141.59-vanadium
-            docker pull redis:5.0.6-alpine3.10
+            # Pull をリトライ付きで安定化
+            pull_retry() { img="$1"; n=0; until [ $n -ge 3 ]; do
+              docker pull "$img" && break
+              n=$((n+1)); sleep $((5*n))
+            done; }
+            pull_retry "docker.io/selenium/hub:3.141.59-vanadium"
+            pull_retry "docker.io/selenium/node-chrome:3.141.59-vanadium"
+            pull_retry "docker.io/redis:5.0.6-alpine3.10"
 
             # 掃除（このプロジェクトのものに限定）
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml down --remove-orphans || true
