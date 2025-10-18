@@ -7,7 +7,7 @@ pipeline {
     BUILD_HOST               = "192.168.10.64"        // 接続先ホスト
     DOCKER_BUILDKIT          = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
-    DOCKER_CONFIG            = "${WORKSPACE}/.docker" // このジョブ専用の docker 認証保存先
+    DOCKER_CONFIG            = "${WORKSPACE}/.docker" // このジョブ専用の docker 認証保存先（クライアント側）
     COMPOSE_PROJECT_NAME     = "docker-kvs"           // プロジェクト名固定（掃除の安全性）
     REGISTRY                 = "docker.io"
   }
@@ -68,6 +68,7 @@ mkdir -p "$DOCKER_CONFIG"
 echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
 test -s "$DOCKER_CONFIG/config.json"
 grep -q '"auths"' "$DOCKER_CONFIG/config.json"
+docker info >/dev/null
 '''
         }
       }
@@ -96,11 +97,13 @@ ssh-add -l || true
 export PATH="$HOME/.local/bin:$PATH"
 export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
-# ===== 重要: DOCKER_AUTH_CONFIG を動的生成して毎APIに認証を同送 =====
-# （秘密が出ないよう echo を止める）
-set +x
-AUTH="$(printf '%s' "$DUSER:$DPASS" | base64 | tr -d '\\n')"
-export DOCKER_AUTH_CONFIG="$(cat <<JSON
+# ===== 使うたびに DOCKER_AUTH_CONFIG を生成（クライアント側から毎APIへ確実に送る）=====
+refresh_auth() {
+  local duser="$1" dpass="$2"
+  set +x
+  local AUTH
+  AUTH="$(printf '%s' "$duser:$dpass" | base64 | tr -d '\\n')"
+  export DOCKER_AUTH_CONFIG="$(cat <<JSON
 {"auths":{
   "https://index.docker.io/v1/":{"auth":"$AUTH"},
   "https://registry-1.docker.io/v2/":{"auth":"$AUTH"},
@@ -108,31 +111,56 @@ export DOCKER_AUTH_CONFIG="$(cat <<JSON
 }}
 JSON
 )"
-set -x
+  set -x
+}
+refresh_auth "$DUSER" "$DPASS"
 
-# 保険：DOCKER_HOST 設定後にも login 実施（エンジン側にトークン保存）
-echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" >/dev/null 2>&1 || true
-# （任意の保険）リモート側でも login 実施
+# ===== 保険：リモート側にも login（ssh 経由で直接 docker CLI を叩くケースに備え）=====
 ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
-  "${SSH_USER}@${BUILD_HOST}" \
-  "echo '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY' || true"
+  "${SSH_USER}@${BUILD_HOST}" '
+    mkdir -p ~/.docker
+    docker logout docker.io >/dev/null 2>&1 || true
+    docker logout https://index.docker.io/v1/ >/dev/null 2>&1 || true
+    docker logout https://registry-1.docker.io/v2/ >/dev/null 2>&1 || true
+    rm -f ~/.docker/config.json || true
+    echo "'"$DPASS"'" | docker login -u "'"$DUSER"'" --password-stdin "'"$REGISTRY"'"
+  '
 
-# Compose ファイル確認
-test -f docker-compose.build.yml && cat docker-compose.build.yml
-
-# 大きいイメージ向け: リトライを厚めに
-pull_retry() {
-  local img="$1" n=0
-  until [ $n -ge 6 ]; do
-    docker pull "$img" && break
-    n=$((n+1)); sleep $((10*n))
+# ===== pull の堅牢化：401/denied 検知で再ログイン＋指数バックオフ =====
+docker_pull_retry_auth() {
+  local img="$1" max=7 try=1
+  while (( try <= max )); do
+    echo "[pull] ($try/$max) $img"
+    # 出力を掴んで判定
+    set +e
+    local out
+    out="$(docker pull "$img" 2>&1)"; rc=$?
+    set -e
+    echo "$out"
+    if (( rc == 0 )); then
+      return 0
+    fi
+    if echo "$out" | grep -qiE 'unauthorized|denied|authentication required'; then
+      echo "[pull] auth error detected; refreshing credentials and re-login..."
+      refresh_auth "$DUSER" "$DPASS"
+      echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" || true
+      ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+        "${SSH_USER}@${BUILD_HOST}" \
+        "echo '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY' || true"
+    fi
+    sleep $(( 10 * try ))
+    (( try++ ))
   done
-  [ $n -lt 6 ] || { echo "FAILED to pull: $img"; exit 1; }
+  echo "[pull] FAILED: $img"; return 1
 }
 
-pull_retry "docker.io/selenium/hub:3.141.59-vanadium"
-pull_retry "docker.io/selenium/node-chrome:3.141.59-vanadium"
-pull_retry "docker.io/redis:5.0.6-alpine3.10"
+# Compose ファイル確認（ログの行つなぎに見えるのは set -x の表示順序の問題）
+test -f docker-compose.build.yml && cat docker-compose.build.yml
+
+# 大きいイメージ向け：堅牢 pull
+docker_pull_retry_auth "docker.io/selenium/hub:3.141.59-vanadium"
+docker_pull_retry_auth "docker.io/selenium/node-chrome:3.141.59-vanadium"
+docker_pull_retry_auth "docker.io/redis:5.0.6-alpine3.10"
 
 # 掃除（このプロジェクトのものに限定）
 docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml down --remove-orphans || true
