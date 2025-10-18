@@ -69,14 +69,13 @@ mkdir -p "$DOCKER_CONFIG"
 echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
 test -s "$DOCKER_CONFIG/config.json"
 grep -q '"auths"' "$DOCKER_CONFIG/config.json"
-# デーモンに触らない確認だけにする
 docker --version
 '''
         }
       }
     }
 
-    stage('Build on remote with compose (over SSH + stable auth)') {
+    stage('Build on remote with compose (over SSH + hardened pulls)') {
       steps {
         withCredentials([
           sshUserPrivateKey(credentialsId: 'ssh_build_host',
@@ -99,7 +98,7 @@ ssh-add -l || true
 export PATH="$HOME/.local/bin:$PATH"
 export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
 
-# ===== 使うたびに DOCKER_AUTH_CONFIG を生成（クライアント側から毎APIへ確実に送る）=====
+# ===== 認証ヘルパ =====
 refresh_auth() {
   local duser="$1" dpass="$2"
   set +x
@@ -117,9 +116,10 @@ JSON
 }
 refresh_auth "$DUSER" "$DPASS"
 
-# ===== 保険：リモート側にも login =====
+# ===== リモート側にも login（ssh 経由コマンド対策）=====
 ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
   "${SSH_USER}@${BUILD_HOST}" '
+    set -e
     mkdir -p ~/.docker
     docker logout docker.io >/dev/null 2>&1 || true
     docker logout https://index.docker.io/v1/ >/dev/null 2>&1 || true
@@ -128,7 +128,33 @@ ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
     echo "'"$DPASS"'" | docker login -u "'"$DUSER"'" --password-stdin "'"$REGISTRY"'"
   '
 
-# ===== pull の堅牢化（401時は再ログインして再試行）=====
+# ===== 1) リモート dockerd: 同時DL数=1 に調整（無権限ならスキップ）=====
+ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  "${SSH_USER}@${BUILD_HOST}" '
+    set -e
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+      TMP=$(mktemp)
+      if [ -f /etc/docker/daemon.json ]; then
+        sudo cp /etc/docker/daemon.json "$TMP"
+      else
+        echo "{}" > "$TMP"
+      fi
+      python3 - "$TMP" <<PY || true
+import json, sys
+p=sys.argv[1]
+j=json.load(open(p))
+j["max-concurrent-downloads"]=1
+open(p,"w").write(json.dumps(j))
+PY
+      sudo mv "$TMP" /etc/docker/daemon.json
+      sudo systemctl restart docker
+      echo "[remote] docker daemon tuned: max-concurrent-downloads=1"
+    else
+      echo "[warn] passwordless sudo not available; skip daemon tuning"
+    fi
+  '
+
+# ===== 2) digest優先でpull（なければタグで）＋401時は再ログインして指数バックオフ =====
 docker_pull_retry_auth() {
   local img="$1" max=7 try=1
   while (( try <= max )); do
@@ -139,7 +165,7 @@ docker_pull_retry_auth() {
     echo "$out"
     if (( rc == 0 )); then return 0; fi
     if echo "$out" | grep -qiE 'unauthorized|denied|authentication required'; then
-      echo "[pull] auth error detected; refreshing credentials and re-login..."
+      echo "[pull] auth error; refreshing credentials..."
       refresh_auth "$DUSER" "$DPASS"
       echo "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY" || true
       ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=yes \
@@ -152,12 +178,28 @@ docker_pull_retry_auth() {
   echo "[pull] FAILED: $img"; return 1
 }
 
-# Compose ファイル確認
+prefer_digest_pull() {
+  local tag="$1"
+  local dg=""
+  if command -v docker >/dev/null 2>&1 && docker buildx imagetools inspect "$tag" >/dev/null 2>&1; then
+    dg="$(docker buildx imagetools inspect "$tag" | awk '/Digest:/ {print $2; exit}')"
+  elif command -v docker >/dev/null 2>&1 && docker manifest inspect "$tag" >/dev/null 2>&1; then
+    dg="$(docker manifest inspect "$tag" | grep -m1 -o 'sha256:[a-f0-9]\\{64\\}')"
+  fi
+  if [ -n "$dg" ]; then
+    echo "[digest] resolved $tag -> @$dg"
+    docker_pull_retry_auth "${tag%@*}@${dg}"
+  else
+    docker_pull_retry_auth "$tag"
+  fi
+}
+
+# Compose ファイル確認（cat直後の "+ ..." は set -x の表示順序）
 test -f docker-compose.build.yml && cat docker-compose.build.yml
 
 # 大きいイメージ向け：堅牢 pull
-docker_pull_retry_auth "docker.io/selenium/hub:3.141.59-vanadium"
-docker_pull_retry_auth "docker.io/selenium/node-chrome:3.141.59-vanadium"
+prefer_digest_pull "docker.io/selenium/hub:3.141.59-vanadium"
+prefer_digest_pull "docker.io/selenium/node-chrome:3.141.59-vanadium"
 docker_pull_retry_auth "docker.io/redis:5.0.6-alpine3.10"
 
 # 掃除（このプロジェクトのものに限定）
