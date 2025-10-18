@@ -3,8 +3,8 @@ pipeline {
   environment {
     DOCKERHUB_USER = "fujiwarakousuke"
     // ホストは「IPのみ」を入れる（ユーザー名は Credentials から受け取る）
-    BUILD_HOST = "192.168.10.64"
-    PROD_HOST  = "192.168.10.64"
+    BUILD_HOST = "jenkins@192.168.10.64"
+    PROD_HOST  = "jenkins@192.168.10.64"
     DOCKER_BUILDKIT = "1"
     COMPOSE_DOCKER_CLI_BUILD = "1"
   }
