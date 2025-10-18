@@ -1,5 +1,5 @@
 
-peline {
+pipeline {
   agent any
   options { timestamps() }
 
