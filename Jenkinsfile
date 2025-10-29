@@ -3,12 +3,12 @@ pipeline {
   options { timestamps() }
 
   environment {
-    BUILD_HOST               = '192.168.10.64'
-    REGISTRY                 = 'docker.io'
     DOCKERHUB_USER           = 'fujiwarakousuke'
+    BUILD_HOST               = '192.168.10.64'
     COMPOSE_PROJECT_NAME     = 'docker-kvs'
-    PULL_PLATFORM            = 'linux/amd64'          // ARM機なら linux/arm64
-    DOCKER_CONFIG            = "${WORKSPACE}/.docker" // ローカル docker login 用
+    REGISTRY                 = 'docker.io'
+    PULL_PLATFORM            = 'linux/amd64'          // ARMなら linux/arm64
+    DOCKER_CONFIG            = "${WORKSPACE}/.docker" // ローカル用
     DOCKER_BUILDKIT          = '1'
     COMPOSE_DOCKER_CLI_BUILD = '1'
   }
@@ -23,7 +23,6 @@ pipeline {
           mkdir -p "$DEST" "$DOCKER_CONFIG" "$HOME/.ssh"
           export PATH="$DEST:$PATH"
 
-          # docker-compose v2 単体バイナリ配置（無ければ）
           if ! command -v docker-compose >/dev/null 2>&1; then
             curl -fsSL -o "$DEST/docker-compose" \
               "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
@@ -31,7 +30,6 @@ pipeline {
           fi
           docker-compose version || true
 
-          # known_hosts 登録
           if ! ssh-keygen -F "$BUILD_HOST" >/dev/null; then
             ssh-keyscan -H "$BUILD_HOST" >> "$HOME/.ssh/known_hosts"
           fi
@@ -67,11 +65,11 @@ pipeline {
         ]) {
           sh '''
             set -eux
-            # ローカル docker login（rate limit/認証回避）
+            # ローカル
             mkdir -p "$DOCKER_CONFIG"
             printf '%s\n' "$DPASS" | docker login -u "$DUSER" --password-stdin "$REGISTRY"
 
-            # リモート docker login
+            # リモート
             SSH_OPTS='-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15'
             ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${BUILD_HOST}" \
               "mkdir -p ~/.docker && printf '%s\\n' '$DPASS' | docker login -u '$DUSER' --password-stdin '$REGISTRY'"
@@ -80,7 +78,7 @@ pipeline {
       }
     }
 
-    stage('Pre-pull large images (SSH exec; NOT using DOCKER_HOST)') {
+    stage('Pre-pull large base images (via SSH, with retry)') {
       steps {
         withCredentials([
           sshUserPrivateKey(credentialsId: 'ssh_build_host',
@@ -92,11 +90,8 @@ pipeline {
         ]) {
           sh '''
             set -eux
-
-            # 念のため DOCKER_HOST 無効化（ここでは使わない）
-            unset DOCKER_HOST || true
-
-            SSH_BASE='-o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o ConnectTimeout=30'
+            SSH_BASE="-o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o ConnectTimeout=30"
+            export SSH_KEY SSH_USER
 
             refresh_auth_remote() {
               printf '%s\n' "$DPASS" | ssh $SSH_BASE -i "$SSH_KEY" "${SSH_USER}@${BUILD_HOST}" \
@@ -119,6 +114,7 @@ pipeline {
                   refresh_auth_remote
                 }
 
+                # ルート不達/タイムアウト系は待って再試行
                 echo "$out" | grep -qiE 'No route to host|Timeout, server .* not responding|Connection timed out' && {
                   echo "[pull] network issue; will retry..."
                 }
@@ -146,20 +142,18 @@ pipeline {
                                            usernameVariable: 'SSH_USER')]) {
           sh '''
             set -eux
-            export PATH="$HOME/.local/bin:$PATH"
-
-            # ここでのみ DOCKER_HOST を使用
+            # DOCKER_HOST=ssh 用の ssh コマンド（KeepAlive 付）
             export DOCKER_HOST="ssh://${SSH_USER}@${BUILD_HOST}"
             export DOCKER_SSH_CMD="ssh -i ${SSH_KEY} -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o ConnectTimeout=30"
+            export PATH="$HOME/.local/bin:$PATH"
 
-            # 早期に疎通チェック
+            # 接続健全性チェック（短時間で失敗なら明示的に落とす）
             ${DOCKER_SSH_CMD} "${SSH_USER}@${BUILD_HOST}" true
 
             test -f docker-compose.build.yml && cat docker-compose.build.yml
 
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml down --remove-orphans || true
-
-            # プロジェクト匿名ボリューム掃除（存在すれば）
+            # プロジェクトの匿名ボリュームだけ掃除（存在すれば）
             docker volume ls -q --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" | xargs -r docker volume rm || true
 
             docker-compose -p "$COMPOSE_PROJECT_NAME" -f docker-compose.build.yml build
